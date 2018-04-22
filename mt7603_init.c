@@ -251,7 +251,8 @@ mt7603_mac_init(struct mt7603_dev *dev)
 		FIELD_PREP(MT_AGG_ARxCR_LIMIT(7), MT7603_RATE_RETRY - 1));
 
 	mt76_wr(dev, MT_AGG_ARCR,
-		(FIELD_PREP(MT_AGG_ARCR_RTS_RATE_THR, 2) |
+		(MT_AGG_ARCR_INIT_RATE1 |
+		 FIELD_PREP(MT_AGG_ARCR_RTS_RATE_THR, 2) |
 		 MT_AGG_ARCR_RATE_DOWN_RATIO_EN |
 		 FIELD_PREP(MT_AGG_ARCR_RATE_DOWN_RATIO, 1) |
 		 FIELD_PREP(MT_AGG_ARCR_RATE_UP_EXTRA_TH, 4)));
@@ -409,6 +410,8 @@ int mt7603_register_device(struct mt7603_dev *dev)
 
 	mutex_init(&dev->mutex);
 	spin_lock_init(&dev->status_lock);
+	spin_lock_init(&dev->irq_lock);
+	spin_lock_init(&dev->mt76.rx_lock);
 	__skb_queue_head_init(&dev->status_list);
 
 	INIT_DELAYED_WORK(&dev->mac_work, mt7603_mac_work);

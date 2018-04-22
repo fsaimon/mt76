@@ -363,8 +363,14 @@ mt7603_rx_get_wcid(struct mt7603_dev *dev, u8 idx, bool unicast)
 	if (unicast || !wcid)
 		return wcid;
 
+	if (!wcid->sta)
+		return NULL;
+
 	sta = container_of(wcid, struct mt7603_sta, wcid);
-	return &sta->vif->wcid;
+	if (!sta->vif)
+		return NULL;
+
+	return &sta->vif->sta.wcid;
 }
 
 static void
@@ -438,7 +444,7 @@ mt7603_mac_fill_rx(struct mt7603_dev *dev, struct sk_buff *skb)
 	if (rxd2 & MT_RXD2_NORMAL_MAX_LEN_ERROR)
 		return -EINVAL;
 
-	if (WARN_ON_ONCE(!sband->channels))
+	if (!sband->channels)
 		return -EINVAL;
 
 	rxd += 4;
@@ -486,9 +492,8 @@ mt7603_mac_fill_rx(struct mt7603_dev *dev, struct sk_buff *skb)
 		case MT_PHY_TYPE_HT_GF:
 		case MT_PHY_TYPE_HT:
 			status->encoding = RX_ENC_HT;
-			break;
-		case MT_PHY_TYPE_VHT:
-			status->encoding = RX_ENC_VHT;
+			if (i > 15)
+				return -EINVAL;
 			break;
 		default:
 			return -EINVAL;
@@ -517,6 +522,8 @@ mt7603_mac_fill_rx(struct mt7603_dev *dev, struct sk_buff *skb)
 		rxd += 6;
 		if ((u8 *) rxd - skb->data >= skb->len)
 			return -EINVAL;
+	} else {
+		return -EINVAL;
 	}
 
 	skb_pull(skb, (u8 *) rxd - skb->data + 2 * remove_pad);
@@ -917,6 +924,8 @@ static bool
 mt7603_fill_txs(struct mt7603_dev *dev, struct mt7603_sta *sta,
 		struct ieee80211_tx_info *info, __le32 *txs_data)
 {
+	int final_idx = 0;
+	u32 final_rate;
 	bool final_mpdu;
 	bool ack_timeout;
 	bool fixed_rate;
@@ -938,6 +947,7 @@ mt7603_fill_txs(struct mt7603_dev *dev, struct mt7603_sta *sta,
 	count = FIELD_GET(MT_TXS4_TX_COUNT, txs);
 
 	txs = le32_to_cpu(txs_data[0]);
+	final_rate = FIELD_GET(MT_TXS0_TX_RATE, txs);
 	ack_timeout = txs & MT_TXS0_ACK_TIMEOUT;
 
 	if (!(txs & MT_TXS0_ACK_ERROR_MASK)) {
@@ -959,6 +969,8 @@ mt7603_fill_txs(struct mt7603_dev *dev, struct mt7603_sta *sta,
 	} else {
 		info->status.ampdu_len = sta->ampdu_count;
 		info->status.ampdu_ack_len = sta->ampdu_acked;
+		if (info->status.ampdu_ack_len)
+			info->flags |= IEEE80211_TX_STAT_ACK;
 	}
 
 	if (ampdu || (info->flags & IEEE80211_TX_CTL_AMPDU))
@@ -996,8 +1008,12 @@ mt7603_fill_txs(struct mt7603_dev *dev, struct mt7603_sta *sta,
 		}
 
 		info->status.rates[i].count = cur_count;
+		final_idx = i;
 		count -= cur_count;
 	}
+
+	if (sta->rates[final_idx].flags & IEEE80211_TX_RC_MCS)
+		info->status.rates[final_idx].idx = final_rate & GENMASK(5, 0);
 
 	return true;
 }
@@ -1079,7 +1095,6 @@ void mt7603_mac_add_txs(struct mt7603_dev *dev, void *data)
 	struct mt7603_sta *msta = NULL;
 	struct mt76_wcid *wcid;
 	__le32 *txs_data = data;
-	void *priv;
 	u32 txs;
 	u8 wcidx;
 	u8 pid;
@@ -1101,14 +1116,14 @@ void mt7603_mac_add_txs(struct mt7603_dev *dev, void *data)
 	if (!wcid)
 		goto out;
 
-	priv = msta = container_of(wcid, struct mt7603_sta, wcid);
-	sta = container_of(priv, struct ieee80211_sta, drv_priv);
+	msta = container_of(wcid, struct mt7603_sta, wcid);
+	sta = wcid_to_sta(wcid);
 
 	pid &= MT_PID_INDEX;
 	if (mt7603_mac_add_txs_skb(dev, msta, pid, txs_data))
 		goto out;
 
-	if (wcidx >= MT7603_WTBL_STA)
+	if (wcidx >= MT7603_WTBL_STA || !sta)
 		goto out;
 
 	if (mt7603_fill_txs(dev, msta, &info, txs_data))
@@ -1163,9 +1178,14 @@ static void mt7603_pse_reset(struct mt7603_dev *dev)
 	/* Reset PSE */
 	mt76_clear(dev, MT_MCU_DEBUG_RESET, MT_MCU_DEBUG_RESET_PSE_S);
 	mt76_set(dev, MT_MCU_DEBUG_RESET, MT_MCU_DEBUG_RESET_PSE);
-	WARN_ON_ONCE(!mt76_poll_msec(dev, MT_MCU_DEBUG_RESET,
-				     MT_MCU_DEBUG_RESET_PSE_S,
-				     MT_MCU_DEBUG_RESET_PSE_S, 500));
+
+	if (!mt76_poll_msec(dev, MT_MCU_DEBUG_RESET,
+			    MT_MCU_DEBUG_RESET_PSE_S,
+			    MT_MCU_DEBUG_RESET_PSE_S, 500))
+		dev->pse_reset_failed++;
+	else
+		dev->pse_reset_failed = 0;
+
 	mt76_clear(dev, MT_MCU_DEBUG_RESET, MT_MCU_DEBUG_RESET_QUEUES);
 }
 
@@ -1207,6 +1227,9 @@ static void mt7603_mac_watchdog_reset(struct mt7603_dev *dev)
 
 	ieee80211_stop_queues(dev->mt76.hw);
 	set_bit(MT76_RESET, &dev->mt76.state);
+
+	/* lock/unlock all queues to ensure that no tx is pending */
+	mt76_txq_schedule_all(&dev->mt76);
 
 	tasklet_disable(&dev->tx_tasklet);
 	tasklet_disable(&dev->pre_tbtt_tasklet);
@@ -1375,7 +1398,8 @@ void mt7603_mac_work(struct work_struct *work)
 				  mt7603_rx_pse_busy) ||
 	    mt7603_watchdog_check(dev, &dev->beacon_check,
 				  RESET_CAUSE_BEACON_STUCK,
-				  NULL)) {
+				  NULL) ||
+	    dev->pse_reset_failed) {
 		dev->beacon_check = 0;
 		dev->tx_dma_check = 0;
 		dev->tx_hang_check = 0;
