@@ -298,6 +298,9 @@ static int mt76x2_mac_reset(struct mt76x2_dev *dev, bool hard)
 	for (i = 0; i < 256; i++)
 		mt76x2_mac_wcid_setup(dev, i, 0, NULL);
 
+	for (i = 0; i < MT_MAX_VIFS; i++)
+		mt76x2_mac_wcid_setup(dev, MT_VIF_WCID(i), i, NULL);
+
 	for (i = 0; i < 16; i++) {
 		for (k = 0; k < 4; k++)
 			mt76x2_mac_shared_key_setup(dev, i, k, NULL);
@@ -377,12 +380,12 @@ void mt76x2_mac_stop(struct mt76x2_dev *dev, bool force)
 
 	/* Wait for MAC to become idle */
 	for (i = 0; i < 300; i++) {
-		if (mt76_rr(dev, MT_MAC_STATUS) &
-		    (MT_MAC_STATUS_RX | MT_MAC_STATUS_TX))
+		if ((mt76_rr(dev, MT_MAC_STATUS) &
+		     (MT_MAC_STATUS_RX | MT_MAC_STATUS_TX)) ||
+		    mt76_rr(dev, MT_BBP(IBI, 12))) {
+			usleep_range(10, 20);
 			continue;
-
-		if (mt76_rr(dev, MT_BBP(IBI, 12)))
-			continue;
+		}
 
 		stopped = true;
 		break;
@@ -489,7 +492,10 @@ void mt76x2_set_tx_ackto(struct mt76x2_dev *dev)
 {
 	u8 ackto, sifs, slottime = dev->slottime;
 
+	/* As defined by IEEE 802.11-2007 17.3.8.6 */
 	slottime += 3 * dev->coverage_class;
+	mt76_rmw_field(dev, MT_BKOFF_SLOT_CFG,
+		       MT_BKOFF_SLOT_CFG_SLOTTIME, slottime);
 
 	sifs = mt76_get_field(dev, MT_XIFS_TIME_CFG,
 			      MT_XIFS_TIME_CFG_OFDM_SIFS);
